@@ -1,0 +1,710 @@
+---
+title: "Project Report 1 - Mutation Analysis (TCGA-BRCA)"
+author: "Group 6 - [Member names here]"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+  - \RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.2,
+                      fig.align = "center")
+set.seed(310)
+```
+
+# Packages
+
+Install once in the console (not in this file), for example
+`install.packages(c("ggplot2", "dplyr", "tidyr", "survival", "survminer",
+"pheatmap", "cluster"))`.
+
+```{r packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(survminer)
+library(pheatmap)
+library(cluster)
+
+theme_set(theme_bw(base_size = 11))
+
+# Same colours for the PAM50 subtypes in every figure
+subtype_cols <- c(LumA = "#1f4e9c", LumB = "#6fa8dc", Her2 = "#e377c2",
+                  Basal = "#d62728", Normal = "#2ca02c")
+# Same colours for mutation status in every figure
+status_cols <- c("Wild-type" = "grey70", "Mutant" = "#d62728")
+```
+
+# Data preparation (Report: Overall Analysis Workflow)
+
+## Load the three data sets
+
+```{r load-data}
+# Clinical file: the first 4 lines are cBioPortal metadata starting with '#'
+clinical <- read.delim("dataset/data_clinical_patient.txt", skip = 4,
+                       quote = "", stringsAsFactors = FALSE)
+
+# Mutations: one row per mutation (MAF format), keep the columns we need
+mutations <- read.delim("dataset/data_mutations.txt", quote = "",
+                        stringsAsFactors = FALSE)
+mutations <- mutations[, c("Hugo_Symbol", "Variant_Classification",
+                           "Variant_Type", "Tumor_Sample_Barcode")]
+
+# Expression: only the header is needed to know which patients have
+# RNA-seq (the full matrix is analysed in Report 2)
+rna_header  <- readLines("dataset/RNAseq_BRCA.csv", n = 1)
+rna_samples <- gsub('"', "", strsplit(rna_header, ",")[[1]][-1])
+# Keep tumour samples only (type code 01-09, while 10-19 are normal tissue)
+rna_tumour <- rna_samples[as.numeric(substr(rna_samples, 14, 15)) < 10]
+
+c(clinical_patients = nrow(clinical),
+  mutation_rows     = nrow(mutations),
+  rna_samples       = length(rna_samples),
+  rna_tumour        = length(rna_tumour))
+```
+
+## Define the cohort: patients with clinical, mutation and expression data
+
+TCGA barcodes use the first 12 characters (`TCGA-XX-XXXX`) for the patient.
+
+```{r cohort}
+mutations$PATIENT_ID <- substr(mutations$Tumor_Sample_Barcode, 1, 12)
+rna_patients <- unique(substr(rna_tumour, 1, 12))
+mut_patients <- unique(mutations$PATIENT_ID)
+
+# Patients present in all three data sets
+common <- Reduce(intersect, list(clinical$PATIENT_ID, mut_patients,
+                                 rna_patients))
+c(clinical = nrow(clinical), mutation = length(mut_patients),
+  expression = length(rna_patients), all_three = length(common))
+```
+
+## Clean the clinical variables
+
+```{r clean-clinical}
+stage_raw <- clinical$AJCC_PATHOLOGIC_TUMOR_STAGE
+
+cohort <- clinical %>%
+  mutate(
+    AGE = as.numeric(AGE),
+    SUBTYPE = factor(sub("BRCA_", "", SUBTYPE),
+                     levels = c("LumA", "LumB", "Her2", "Basal",
+                                "Normal")),
+    # Collapse sub-stages (IIA, IIB, ...) into I-IV, STAGE X becomes NA
+    STAGE = case_when(grepl("^STAGE IV",  stage_raw) ~ "IV",
+                      grepl("^STAGE III", stage_raw) ~ "III",
+                      grepl("^STAGE II",  stage_raw) ~ "II",
+                      grepl("^STAGE I",   stage_raw) ~ "I",
+                      TRUE ~ NA_character_),
+    STAGE_GROUP = factor(case_when(
+      STAGE %in% c("I", "II")   ~ "Early (I-II)",
+      STAGE %in% c("III", "IV") ~ "Late (III-IV)")),
+    HISTOLOGY = case_when(ICD_O_3_HISTOLOGY == "8500/3" ~ "Ductal",
+                          ICD_O_3_HISTOLOGY == "8520/3" ~ "Lobular",
+                          TRUE ~ "Other/Mixed"),
+    # "1:DECEASED" becomes 1 and "0:LIVING" becomes 0
+    OS_EVENT   = suppressWarnings(as.numeric(substr(OS_STATUS, 1, 1))),
+    OS_MONTHS  = as.numeric(OS_MONTHS),
+    PFS_EVENT  = suppressWarnings(as.numeric(substr(PFS_STATUS, 1, 1))),
+    PFS_MONTHS = as.numeric(PFS_MONTHS)
+  ) %>%
+  filter(PATIENT_ID %in% common)
+
+table(cohort$SEX)
+table(cohort$SUBTYPE, useNA = "ifany")
+table(cohort$STAGE, useNA = "ifany")
+```
+
+## Filter to non-synonymous (protein-changing) mutations
+
+Silent, intronic, UTR, flanking, RNA and Splice_Region variants do not change
+the protein sequence, which is why we remove them.
+
+```{r nonsyn}
+nonsyn_classes <- c("Missense_Mutation", "Nonsense_Mutation",
+                    "Frame_Shift_Del", "Frame_Shift_Ins",
+                    "In_Frame_Del", "In_Frame_Ins", "Splice_Site",
+                    "Nonstop_Mutation", "Translation_Start_Site")
+
+mut    <- mutations %>% filter(PATIENT_ID %in% common)
+mut_ns <- mut %>% filter(Variant_Classification %in% nonsyn_classes)
+
+c(all_mutations = nrow(mut), non_synonymous = nrow(mut_ns))
+```
+
+## Build the binary mutation matrix and per-patient features
+
+```{r mut-matrix}
+# Patients x genes matrix, 1 = at least one non-synonymous mutation
+pairs <- distinct(mut_ns, PATIENT_ID, Hugo_Symbol)
+mut_matrix <- unclass(table(factor(pairs$PATIENT_ID, levels = common),
+                            pairs$Hugo_Symbol))
+dim(mut_matrix)
+
+# Percentage of patients with a mutation in each gene
+gene_freq <- data.frame(gene = colnames(mut_matrix),
+                        n_patients = colSums(mut_matrix)) %>%
+  mutate(pct = 100 * n_patients / length(common)) %>%
+  arrange(desc(n_patients))
+head(gene_freq, 10)
+
+# Mutation burden per patient and status of the key driver genes
+drivers <- c("TP53", "PIK3CA", "CDH1", "GATA3", "MAP3K1", "KMT2C", "PTEN")
+burden  <- mut_ns %>% count(PATIENT_ID, name = "N_NONSYN")
+
+cohort <- cohort %>%
+  left_join(burden, by = "PATIENT_ID") %>%
+  mutate(N_NONSYN = coalesce(N_NONSYN, 0L))
+for (g in drivers) {
+  is_mut <- mut_matrix[cohort$PATIENT_ID, g] == 1
+  cohort[[g]] <- factor(ifelse(is_mut, "Mutant", "Wild-type"),
+                        levels = c("Wild-type", "Mutant"))
+}
+
+# Save the cleaned objects so teammates can load them directly
+dir.create("processed", showWarnings = FALSE)
+saveRDS(list(cohort = cohort, mut_ns = mut_ns, mut_matrix = mut_matrix,
+             gene_freq = gene_freq), "processed/report1_objects.rds")
+```
+
+# Investigation 1: Cohort demographics (Report: Results 1)
+
+```{r inv1-age, fig.height=3.2}
+summary(cohort$AGE)
+
+# Boxplot of age with each patient shown as a point
+ggplot(cohort, aes(x = "", y = AGE)) +
+  geom_boxplot(fill = "grey85", width = 0.4) +
+  geom_jitter(width = 0.12, alpha = 0.25, size = 0.8) +
+  coord_flip() +
+  labs(title = "Age at diagnosis", x = NULL, y = "Age (years)")
+```
+
+From the plot, we can see that the age at diagnosis ranges from 26 to 90
+years, with a median of 58 years and a mean of 58.31 years. The spread is
+fairly symmetric, which means there is no strong skew toward younger or older
+patients.
+
+```{r inv1-age-subtype, fig.height=3.2}
+# Median age per subtype, then a Kruskal-Wallis test
+tapply(cohort$AGE, cohort$SUBTYPE, median)
+
+ggplot(cohort, aes(x = AGE, y = SUBTYPE, fill = SUBTYPE)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_fill_manual(values = subtype_cols, na.value = "grey70") +
+  labs(title = "Age at diagnosis by PAM50 subtype",
+       x = "Age (years)", y = "Subtype")
+
+kruskal.test(AGE ~ SUBTYPE, data = cohort)
+```
+
+Based on the output above, age differs between the PAM50 subtypes
+(Kruskal-Wallis p = 0.007058). From the plot, we can see that Basal patients
+(median 54 years) and Her2 patients (median 56.5 years) are diagnosed younger
+than LumA patients (median 60 years).
+
+```{r inv1-categorical, fig.height=3.2}
+# Number of patients in each subtype and stage
+ggplot(filter(cohort, !is.na(SUBTYPE)), aes(x = SUBTYPE, fill = SUBTYPE)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3) +
+  scale_fill_manual(values = subtype_cols) +
+  labs(title = "PAM50 molecular subtype", x = "Subtype", y = "Patients")
+
+ggplot(filter(cohort, !is.na(STAGE)), aes(x = STAGE)) +
+  geom_bar(fill = "grey40") +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3) +
+  labs(title = "AJCC pathologic stage", x = "Stage", y = "Patients")
+
+table(cohort$RACE)
+table(cohort$HISTOLOGY)
+```
+
+From the plots, we can see that LumA is by far the largest subtype (499
+patients), followed by LumB (197) and Basal (171). Most tumours are stage II
+(581 patients), while only 18 patients are stage IV, which means late-stage
+disease is rare in this cohort. Most tumours are ductal (740) and 163 are
+lobular.
+
+```{r inv1-survival}
+c(deaths = sum(cohort$OS_EVENT, na.rm = TRUE),
+  progression_events = sum(cohort$PFS_EVENT, na.rm = TRUE),
+  median_followup_months = median(cohort$OS_MONTHS, na.rm = TRUE))
+
+# Kaplan-Meier curves of overall survival for each subtype
+fit_sub <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ SUBTYPE, data = cohort)
+ggsurvplot(fit_sub, data = cohort, pval = TRUE,
+           palette = unname(subtype_cols),
+           legend.labs = levels(cohort$SUBTYPE), legend.title = "Subtype",
+           title = "Overall survival by PAM50 subtype",
+           xlab = "Months", ylab = "Survival probability",
+           ggtheme = theme_bw())
+```
+
+Based on the output above, there are only 136 deaths and the median
+follow-up is about 27 months, which means survival tests in this cohort have
+limited power. From the plot, we can see that overall survival still differs
+between subtypes (log-rank p = 0.024).
+
+# Investigation 2: Mutation landscape (Report: Results 2)
+
+```{r inv2-types, fig.height=3.8}
+# Count every mutation type and mark the ones we keep
+type_counts <- mut %>%
+  count(Variant_Classification) %>%
+  mutate(kept = ifelse(Variant_Classification %in% nonsyn_classes,
+                       "Non-synonymous (kept)", "Removed"))
+
+ggplot(type_counts,
+       aes(x = reorder(Variant_Classification, n), y = n, fill = kept)) +
+  geom_col() + coord_flip() +
+  scale_fill_manual(values = c("Non-synonymous (kept)" = "#1f4e9c",
+                               Removed = "grey70")) +
+  labs(title = "Mutation types in the cohort", x = "Mutation type",
+       y = "Number of mutations", fill = "Filter")
+```
+
+From the plot, we can see that missense mutations are by far the most common
+type, followed by silent mutations. After removing the variants that do not
+change the protein, we keep 85360 of the 130300 mutations.
+
+```{r inv2-burden, fig.height=3.5}
+summary(cohort$N_NONSYN)
+
+# One bar per patient, sorted from most to fewest mutations
+burden_plot <- cohort %>% arrange(desc(N_NONSYN)) %>%
+  mutate(PATIENT_ID = factor(PATIENT_ID, levels = PATIENT_ID))
+
+ggplot(burden_plot, aes(x = PATIENT_ID, y = N_NONSYN, fill = SUBTYPE)) +
+  geom_col(width = 1) +
+  scale_y_log10() +
+  scale_fill_manual(values = subtype_cols, na.value = "grey70") +
+  labs(title = "Non-synonymous mutations per patient",
+       x = paste0("Patients (n = ", nrow(cohort), ")"),
+       y = "Mutations (log10 scale)", fill = "Subtype") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+From the plot, we can see that most patients carry between 26 and 70
+non-synonymous mutations (median 41). However, a few hypermutated tumours
+carry far more (up to 5340), which is why we use a log scale and
+rank-based tests for mutation burden.
+
+```{r inv2-burden-subtype, fig.height=3.5}
+# Median burden per subtype, then a Kruskal-Wallis test
+tapply(cohort$N_NONSYN, cohort$SUBTYPE, median)
+
+ggplot(cohort, aes(x = SUBTYPE, y = N_NONSYN + 1, fill = SUBTYPE)) +
+  geom_boxplot(show.legend = FALSE) + scale_y_log10() +
+  scale_fill_manual(values = subtype_cols, na.value = "grey70") +
+  labs(title = "Mutation burden by subtype", x = "Subtype",
+       y = "Non-synonymous mutations + 1 (log10)")
+
+kruskal.test(N_NONSYN ~ SUBTYPE, data = cohort)
+```
+
+Based on the output above, mutation burden differs strongly between subtypes
+(Kruskal-Wallis p < 2.2e-16). From the plot, we can see that Her2 (median 72)
+and Basal (median 69) tumours carry more than twice as many mutations as LumA
+tumours (median 30), which fits with these subtypes being more genomically
+unstable.
+
+```{r inv2-topgenes, fig.height=4.2}
+# Top 20 genes by percentage of patients mutated
+top20 <- head(gene_freq, 20)
+ggplot(top20, aes(x = reorder(gene, pct), y = pct)) +
+  geom_col(fill = "#1f4e9c") + coord_flip() +
+  geom_text(aes(label = sprintf("%.2f%%", pct)), hjust = -0.1, size = 3) +
+  expand_limits(y = max(top20$pct) * 1.15) +
+  labs(title = "Top 20 most frequently mutated genes", x = "Gene",
+       y = "Patients with a non-synonymous mutation (%)")
+```
+
+From the plot, we can see that PIK3CA (34.39%) and TP53 (34.29%) are the two
+most frequently mutated genes, followed by TTN, CDH1, GATA3 and MUC16. TTN and
+MUC16 are very long genes, which means they collect random mutations and are
+not likely to be drivers.
+
+# Investigation 3: Driver genes vs PAM50 subtype (Report: Results 3)
+
+```{r inv3-freq, fig.height=4.5}
+# Percentage of patients mutated for each driver gene within each subtype
+driver_long <- cohort %>%
+  filter(!is.na(SUBTYPE)) %>%
+  select(PATIENT_ID, SUBTYPE, all_of(drivers)) %>%
+  pivot_longer(all_of(drivers), names_to = "gene",
+               values_to = "status") %>%
+  group_by(gene, SUBTYPE) %>%
+  summarise(pct = 100 * mean(status == "Mutant"), n = n(),
+            .groups = "drop") %>%
+  mutate(gene = factor(gene, levels = drivers))
+
+ggplot(driver_long, aes(x = SUBTYPE, y = pct, fill = SUBTYPE)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ gene, nrow = 2) +
+  scale_fill_manual(values = subtype_cols) +
+  labs(title = "Driver gene mutation frequency by PAM50 subtype",
+       x = "Subtype", y = "Patients mutated (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From the plot, we can see that TP53 is mutated mostly in Basal and Her2
+tumours, while PIK3CA, CDH1, GATA3 and MAP3K1 are mutated mostly in luminal
+tumours. On the other hand, PTEN looks similar across all subtypes.
+
+```{r inv3-tests}
+# Fisher's exact test of mutation status vs subtype for each gene
+# (Monte-Carlo p-value for the 5x2 table), then BH correction
+sub_tests <- lapply(drivers, function(g) {
+  tab <- table(cohort$SUBTYPE, cohort[[g]])
+  p <- fisher.test(tab, simulate.p.value = TRUE, B = 1e5)$p.value
+  data.frame(gene = g,
+             pct_mutated = round(100 * mean(cohort[[g]] == "Mutant"), 2),
+             p_value = p)
+})
+sub_tests <- bind_rows(sub_tests) %>%
+  mutate(p_adj_BH = p.adjust(p_value, "BH"))
+knitr::kable(sub_tests, digits = 5,
+             caption = "Mutation status vs PAM50 subtype")
+```
+
+Based on the output above, TP53, PIK3CA, CDH1, GATA3 and MAP3K1 are all
+associated with subtype after correction (adjusted p = 0.00001, the smallest
+value possible with 100000 simulations). KMT2C is borderline (adjusted
+p = 0.06088) and PTEN is not associated with subtype (adjusted p = 0.97358).
+
+```{r inv3-cooccurrence}
+# Do TP53 and PIK3CA mutations occur in the same patients?
+tab_tp53_pik3ca <- table(TP53 = cohort$TP53, PIK3CA = cohort$PIK3CA)
+tab_tp53_pik3ca
+fisher.test(tab_tp53_pik3ca)   # odds ratio < 1 means mutually exclusive
+```
+
+Based on the output above, only 80 patients carry both TP53 and PIK3CA
+mutations, and the odds ratio is 0.45 (p = 4.494e-08). This means the two
+genes tend to be mutually exclusive, which is likely because TP53 marks the
+Basal and Her2 subtypes while PIK3CA marks the luminal subtypes.
+
+# Investigation 4: Mutations vs other clinical variables (Report: Results 4)
+
+## CDH1 mutation vs tumour histology (ductal vs lobular)
+
+```{r inv4-cdh1, fig.height=3.2}
+# 2x2 table of histology vs CDH1 status and Fisher's exact test
+hist_df  <- cohort %>% filter(HISTOLOGY %in% c("Ductal", "Lobular"))
+tab_cdh1 <- table(Histology = hist_df$HISTOLOGY, CDH1 = hist_df$CDH1)
+tab_cdh1
+round(100 * prop.table(tab_cdh1, 1), 2)
+fisher.test(tab_cdh1)
+
+ggplot(hist_df, aes(x = HISTOLOGY, fill = CDH1)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = status_cols) +
+  labs(title = "CDH1 mutation status by histology", x = "Histology",
+       y = "Patients", fill = "CDH1 status")
+```
+
+Based on the output above, CDH1 is mutated in 60.74% of lobular tumours but
+only 2.70% of ductal tumours (odds ratio 55.11, p < 2.2e-16). CDH1 encodes
+E-cadherin, and its loss is the hallmark of lobular carcinoma, which is why
+this is the clearest association in our data.
+
+## TP53 mutation vs age at diagnosis
+
+```{r inv4-tp53-age, fig.height=3.2}
+# Median age in each group, then a Wilcoxon rank-sum test
+tapply(cohort$AGE, cohort$TP53, median)
+
+ggplot(cohort, aes(x = TP53, y = AGE, fill = TP53)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_fill_manual(values = status_cols) +
+  labs(title = "Age at diagnosis by TP53 status", x = "TP53 status",
+       y = "Age (years)")
+
+wilcox.test(AGE ~ TP53, data = cohort)
+```
+
+```{r inv4-tp53-age-values, include=FALSE}
+age_med <- tapply(cohort$AGE, cohort$TP53, median)
+```
+
+Based on the output above, TP53-mutant patients are younger at diagnosis
+(median `r age_med[["Mutant"]]` years) than wild-type patients (median
+`r age_med[["Wild-type"]]` years), and the difference is significant
+(Wilcoxon p = 0.007354). This fits with TP53 being common in the Basal
+subtype, which tends to affect younger patients.
+
+## Mutation burden vs age and stage
+
+```{r inv4-burden, fig.height=3.2}
+# Spearman correlation between age and mutation burden
+cor.test(cohort$AGE, cohort$N_NONSYN, method = "spearman", exact = FALSE)
+
+ggplot(cohort, aes(x = AGE, y = N_NONSYN + 1)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "loess", colour = "#d62728") +
+  scale_y_log10() +
+  labs(title = "Mutation burden vs age", x = "Age (years)",
+       y = "Non-synonymous mutations + 1 (log10)")
+```
+
+Based on the output above, mutation burden increases only slightly with age
+(Spearman rho = 0.098, p = 0.001855). From the plot, we can see that the
+trend line is almost flat, which means age explains very little of the
+variation in burden.
+
+```{r inv4-burden-stage, fig.height=3.2}
+# Burden across stages, compared with a Kruskal-Wallis test
+ggplot(filter(cohort, !is.na(STAGE)), aes(x = STAGE, y = N_NONSYN + 1)) +
+  geom_boxplot(fill = "grey85") + scale_y_log10() +
+  labs(title = "Mutation burden by stage", x = "Stage",
+       y = "Non-synonymous mutations + 1 (log10)")
+
+kruskal.test(N_NONSYN ~ STAGE, data = cohort)
+```
+
+From the plot, we can see that the boxes overlap across all stages, and the
+test confirms there is no significant difference (Kruskal-Wallis p = 0.1457).
+This means a higher mutation burden does not go with a more advanced stage in
+this cohort.
+
+# Investigation 5: Survival by mutation status (Report: Results 5)
+
+```{r inv5-km-function}
+# Helper that draws a Kaplan-Meier plot with a log-rank p-value
+km_plot <- function(var, name, time = "OS_MONTHS", event = "OS_EVENT",
+                    label = "Overall survival") {
+  df  <- cohort[!is.na(cohort[[time]]) & !is.na(cohort[[event]]), ]
+  f   <- as.formula(paste0("Surv(", time, ", ", event, ") ~ ", var))
+  fit <- surv_fit(f, data = df)
+  pal <- c("grey40", "#d62728", "#1f4e9c", "#e377c2", "#2ca02c",
+           "#ff7f0e")
+  ggsurvplot(fit, data = df, pval = TRUE, conf.int = FALSE,
+             palette = pal[seq_along(fit$strata)],
+             legend.title = name,
+             legend.labs = sub(".*=", "", names(fit$strata)),
+             title = paste(label, "by", name), xlab = "Months",
+             ylab = "Survival probability", ggtheme = theme_bw())
+}
+```
+
+```{r inv5-km-tp53, fig.height=4}
+# Overall survival, TP53 mutant vs wild-type
+km_plot("TP53", "TP53 status")
+```
+
+From the plot, we can see that the TP53 curves overlap, and the difference
+is not significant (log-rank p = 0.4).
+
+```{r inv5-km-pik3ca, fig.height=4}
+# Overall survival, PIK3CA mutant vs wild-type
+km_plot("PIK3CA", "PIK3CA status")
+```
+
+From the plot, we can see that PIK3CA status also does not separate overall
+survival (log-rank p = 0.44).
+
+```{r inv5-km-pfs, fig.height=4}
+# Progression-free survival has a different event definition
+km_plot("TP53", "TP53 status", "PFS_MONTHS", "PFS_EVENT",
+        "Progression-free survival")
+```
+
+Since overall survival has few events, we also tried progression-free
+survival. However, TP53 status is still not significant (log-rank p = 0.52).
+
+```{r inv5-combined, fig.height=4}
+# Four groups based on TP53 and PIK3CA together
+cohort <- cohort %>%
+  mutate(TP53_PIK3CA = factor(case_when(
+    TP53 == "Mutant" & PIK3CA == "Mutant" ~ "Both",
+    TP53 == "Mutant"                      ~ "TP53 only",
+    PIK3CA == "Mutant"                    ~ "PIK3CA only",
+    TRUE                                  ~ "Neither"),
+    levels = c("Neither", "TP53 only", "PIK3CA only", "Both")))
+table(cohort$TP53_PIK3CA)
+km_plot("TP53_PIK3CA", "TP53 and PIK3CA status")
+```
+
+From the plot, we can see that the four groups (Neither 395, TP53 only 265,
+PIK3CA only 266, Both 80) do not differ in overall survival (log-rank
+p = 0.49).
+
+```{r inv5-cox}
+# Cox model to adjust mutation status for age and stage
+cox <- coxph(Surv(OS_MONTHS, OS_EVENT) ~ TP53 + PIK3CA + AGE +
+               STAGE_GROUP, data = cohort)
+cox_tab <- cbind(summary(cox)$conf.int[, c(1, 3, 4)],
+                 p = summary(cox)$coefficients[, 5])
+colnames(cox_tab) <- c("HR", "CI_low", "CI_high", "p")
+knitr::kable(cox_tab, digits = 3,
+             caption = "Cox proportional hazards model (overall survival)")
+cox.zph(cox)   # check of the proportional hazards assumption
+```
+
+Based on the output above, TP53 mutation becomes a significant risk factor
+once we adjust for age and stage (HR = 1.617, 95% CI 1.120 to 2.334,
+p = 0.010). This differs from the Kaplan-Meier result because TP53-mutant
+patients are younger, and each extra year of age raises the risk of death
+(HR = 1.039 per year), which hides the TP53 effect when age is ignored. Late stage has
+the largest effect (HR = 3.077). However, `cox.zph()` shows that stage breaks
+the proportional hazards assumption (p = 0.006), so this model should be
+interpreted with care.
+
+# Investigation 6: Clustering of the mutation matrix (Report: Results 6)
+
+## Feature selection
+
+```{r inv6-features}
+# Use the 30 most frequently mutated genes as features
+feat_genes <- head(gene_freq$gene, 30)
+X <- mut_matrix[, feat_genes]
+
+# Patients with no mutation in any feature gene have no defined binary
+# distance, so we keep them aside as a "No frequent mutation" group
+has_mut <- rowSums(X) > 0
+table(has_mut)
+Xc <- X[has_mut, ]
+
+# Binary (Jaccard) distance between patients
+d <- dist(Xc, method = "binary")
+```
+
+## Approach A: hierarchical clustering and Approach B: PAM (k-medoids)
+
+```{r inv6-choose-k, fig.height=3}
+# Approach A uses Ward.D2 linkage on the binary distance
+hc <- hclust(d, method = "ward.D2")
+
+# Average silhouette width for k = 2 to 8 with both methods
+ks <- 2:8
+sil <- data.frame(
+  k = ks,
+  Hierarchical = sapply(ks, function(k)
+    mean(silhouette(cutree(hc, k), d)[, 3])),
+  PAM = sapply(ks, function(k)
+    pam(d, k, diss = TRUE)$silinfo$avg.width))
+knitr::kable(sil, digits = 3, caption = "Average silhouette width")
+
+sil %>%
+  pivot_longer(-k, names_to = "method", values_to = "silhouette") %>%
+  ggplot(aes(k, silhouette, colour = method)) +
+  geom_line() + geom_point() +
+  labs(title = "Choosing the number of clusters",
+       x = "Number of clusters (k)", y = "Average silhouette width",
+       colour = "Method")
+```
+
+Based on the output above, all silhouette widths are below 0.2, which means
+the clusters are weak. This is expected because the mutation matrix is very
+sparse. We use k = 4 because it gives clusters that are easy to interpret,
+even though hierarchical clustering scores slightly higher at k = 3.
+
+```{r inv6-cluster}
+k <- 4   # chosen for interpretability (see the silhouette table)
+cl_hc  <- cutree(hc, k)
+cl_pam <- pam(d, k, diss = TRUE)$clustering
+
+# Agreement between the two methods
+table(Hierarchical = cl_hc, PAM = cl_pam)
+
+# Add the hierarchical clusters to the cohort table
+cohort$CLUSTER <- "No frequent mutation"
+cohort$CLUSTER[match(rownames(Xc), cohort$PATIENT_ID)] <- paste0("C", cl_hc)
+cohort$CLUSTER <- factor(cohort$CLUSTER,
+                         levels = c(paste0("C", 1:k),
+                                    "No frequent mutation"))
+table(cohort$CLUSTER)
+```
+
+Based on the output above, almost all of hierarchical C1 (75 of 77 patients)
+falls in PAM cluster 1, and all of C4 (54 patients) falls in PAM cluster 2.
+However, PAM spreads the large mixed cluster C2 across all four of its
+clusters, which shows that this group has no stable structure. We use the
+hierarchical clusters for the rest of the analysis.
+
+```{r inv6-heatmap, fig.height=7, fig.width=9.5, out.width="100%"}
+# Heatmap of the feature genes, patients ordered by the dendrogram
+ann <- data.frame(
+  Subtype = cohort$SUBTYPE[match(rownames(Xc), cohort$PATIENT_ID)],
+  Cluster = factor(paste0("C", cl_hc)),
+  row.names = rownames(Xc))
+pheatmap(t(Xc), cluster_cols = hc, cluster_rows = FALSE,
+         color = c("white", "black"), legend = FALSE,
+         annotation_col = ann,
+         annotation_colors = list(Subtype = subtype_cols),
+         show_colnames = FALSE, fontsize = 8, fontsize_row = 7,
+         cutree_cols = k, treeheight_col = 30,
+         main = paste("Top 30 mutated genes with patients clustered",
+                      "(binary distance, Ward.D2)"))
+```
+
+From the heatmap, we can see that each small cluster is built around one or
+two genes, such as GATA3 or TP53, while most patients fall into one large
+mixed cluster.
+
+## What characterises each cluster?
+
+```{r inv6-profile}
+# Percentage of patients mutated in each gene, per cluster
+profile <- sapply(split(as.data.frame(Xc), cl_hc),
+                  function(m) round(100 * colMeans(m), 1))
+colnames(profile) <- paste0("C", colnames(profile))
+top_rows <- order(-apply(profile, 1, max))
+knitr::kable(head(profile[top_rows, ], 12),
+             caption = "% of patients mutated in each gene, by cluster")
+```
+
+Based on the output above, C1 is a GATA3 cluster (98.7% mutated), C3 is a
+PIK3CA cluster that also carries CDH1 and MAP3K1 mutations (74.1%, 36.8% and
+24.1%), and C4 is a TP53-only cluster (100% TP53). C2 is a mixed cluster with
+both TP53 (44.7%) and PIK3CA (35.1%) mutations.
+
+## Clusters vs clinical data
+
+```{r inv6-clinical, fig.height=3.5}
+# Cluster vs subtype, with a simulated chi-square p-value
+tab_cl <- table(cohort$CLUSTER, cohort$SUBTYPE)
+tab_cl
+chisq.test(tab_cl, simulate.p.value = TRUE, B = 1e5)
+
+ggplot(filter(cohort, !is.na(SUBTYPE)), aes(x = CLUSTER, fill = SUBTYPE)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = subtype_cols) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "PAM50 subtype composition of each mutation cluster",
+       x = "Cluster", y = "Patients", fill = "Subtype") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+
+# Cluster vs early or late stage
+chisq.test(table(cohort$CLUSTER, cohort$STAGE_GROUP))
+```
+
+From the plot, we can see that the clusters match the PAM50 subtypes closely
+(p = 1e-05). C3 is almost all LumA (147 patients), and C4 is mostly Basal
+(34 of the 54 patients). On the other hand, the clusters are not related to
+stage (p = 0.5429).
+
+```{r inv6-survival, fig.height=4}
+# Overall survival for each mutation cluster
+km_plot("CLUSTER", "Cluster")
+```
+
+From the plot, we can see that the clusters do not differ in overall survival
+(log-rank p = 0.9). Overall, mutation clusters capture the subtype biology
+but do not add prognostic information on their own.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

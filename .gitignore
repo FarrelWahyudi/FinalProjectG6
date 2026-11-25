@@ -2,3 +2,22 @@
 dataset/RNAseq_BRCA.csv
 dataset/data_mutations.txt
 .DS_Store
+
+# R session files
+.RData
+.Rhistory
+.Rproj.user/
+
+# Knitting build files
+*.knit.md
+*_files/
+*.tex
+*.log
+
+# Local BRCA re-download (too large for GitHub, not needed for the reports)
+RNAseq.csv
+TCGA-BRCA/
+GDCdata/
+MANIFEST.txt
+df.rds
+results.rds
