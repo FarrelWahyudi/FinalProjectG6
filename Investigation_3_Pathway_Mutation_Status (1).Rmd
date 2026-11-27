@@ -1,0 +1,298 @@
+---
+title: "Investigation 3: Pathway-level mutation status by PAM50 subtype (TCGA-BRCA)"
+author: "Group 6"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+  - \RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.2,
+                      fig.align = "center")
+set.seed(310)
+```
+
+# Packages and data
+
+This file builds on `mutationAnalysis.Rmd`, which cleans the clinical data,
+defines the cohort of 1,006 patients with clinical, mutation and expression
+data, filters to non-synonymous mutations and saves the objects to
+`processed/report1_objects.rds`. We load the same file used by
+`investigation2.Rmd` so the analyses use the same patients and mutation calls.
+
+```{r inv3-packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+theme_set(theme_bw(base_size = 11))
+
+# Keep the same colours for the three panels in every figure.
+pathway_cols <- c("PI3K/AKT" = "#1F5D88",
+                  "p53/DNA damage response" = "#B14A39",
+                  "MAPK/JNK" = "#6A558D")
+```
+
+```{r inv3-load}
+report1 <- readRDS("processed/report1_objects.rds")
+cohort <- report1$cohort
+mut_ns <- report1$mut_ns
+
+dim(cohort)
+table(cohort$SUBTYPE, useNA = "ifany")
+```
+
+Question: does the frequency of mutations in selected pathway gene panels
+differ between PAM50 breast cancer subtypes, and how much of each panel's
+result comes from its most frequently mutated gene?
+
+# Define the pathway gene panels
+
+Mutations in different genes can affect the same biological process.
+We therefore group selected genes into three panels based on the breast
+cancer signalling pathways discussed by TCGA [1]. These panels represent
+selected parts of PI3K/AKT signalling, the p53/DNA damage response and
+MAPK/JNK signalling.
+
+```{r inv3-panels}
+pathway_genes <- list(
+  "PI3K/AKT" = c("PIK3CA", "PIK3R1", "PTEN", "AKT1"),
+  "p53/DNA damage response" = c("TP53", "ATM", "CHEK2"),
+  "MAPK/JNK" = c("MAP3K1", "MAP2K4")
+)
+
+panel_genes <- data.frame(
+  Panel = names(pathway_genes),
+  Genes = vapply(pathway_genes, paste, collapse = ", ", FUN.VALUE = character(1))
+)
+knitr::kable(panel_genes, row.names = FALSE,
+             caption = "Selected genes used to define each panel")
+```
+
+A patient has a panel mutation if their tumour has at least one
+non-synonymous call in any of the selected genes. For example, a patient
+with both TP53 and ATM mutations counts once in the p53/DNA damage response
+panel. The same patient can count in more than one panel. This approach
+also prevents repeated mutation records from counting the same patient
+more than once within a panel.
+
+# Keep patients with a known PAM50 subtype
+
+PAM50 classifies tumours using gene expression. We use the recorded subtype
+labels to compare mutation frequencies. Patients without a subtype label
+are excluded from this investigation.
+
+```{r inv3-subtypes}
+subtype_levels <- c("LumA", "LumB", "Her2", "Basal", "Normal")
+subtype_names <- c("Luminal A", "Luminal B", "HER2-enriched",
+                    "Basal-like", "Normal-like")
+
+subtype_df <- cohort %>%
+  mutate(SUBTYPE = factor(sub("^BRCA_", "", as.character(SUBTYPE)),
+                          levels = subtype_levels)) %>%
+  filter(!is.na(SUBTYPE))
+
+c(kept = nrow(subtype_df), removed = nrow(cohort) - nrow(subtype_df))
+subtype_summary <- subtype_df %>% count(SUBTYPE, name = "Patients")
+knitr::kable(subtype_summary, row.names = FALSE,
+             caption = "Patients with a recorded PAM50 subtype")
+```
+
+Based on the output above, we keep `r nrow(subtype_df)` patients and exclude
+`r nrow(cohort) - nrow(subtype_df)` without a recognised subtype. The groups
+contain 499 Luminal A, 197 Luminal B, 78 HER2-enriched, 171 Basal-like and
+36 Normal-like tumours. The group sizes differ substantially, so we compare
+the percentage mutated within each subtype.
+
+# Assign mutation status to each panel
+
+We create one record per patient and panel. Status is either
+"Panel mutation" or "No panel mutation" and is based on the
+non-synonymous calls retained during the shared data preparation.
+
+```{r inv3-status}
+pathway_df <- bind_rows(lapply(names(pathway_genes), function(panel) {
+  # Membership checks count patients once, regardless of repeated calls.
+  mutated_patients <- mut_ns$PATIENT_ID[
+    mut_ns$Hugo_Symbol %in% pathway_genes[[panel]]]
+
+  subtype_df %>%
+    select(PATIENT_ID, SUBTYPE) %>%
+    mutate(Pathway = panel,
+           STATUS = ifelse(PATIENT_ID %in% mutated_patients,
+                           "Panel mutation", "No panel mutation"))
+})) %>%
+  mutate(Pathway = factor(Pathway, levels = names(pathway_genes)),
+         STATUS = factor(STATUS,
+                         levels = c("No panel mutation", "Panel mutation")))
+
+panel_summary <- pathway_df %>%
+  group_by(Pathway) %>%
+  summarise(Patients = n(),
+            Mutated = sum(STATUS == "Panel mutation"),
+            Percent = round(100 * Mutated / Patients, 1),
+            .groups = "drop")
+knitr::kable(panel_summary, row.names = FALSE,
+             caption = "Panel mutations among patients with a known subtype")
+```
+
+Based on the output above, 423 of 981 patients have a mutation in the
+PI3K/AKT panel, 366 in the p53/DNA damage response panel and 127 in the
+MAPK/JNK panel. These totals can overlap because patients may have
+mutations in several panels.
+
+# Mutation frequencies by PAM50 subtype
+
+For each panel, we divide the number of patients with a mutation by the
+total number of patients in that subtype. The bars use these percentages,
+and the subtype sample sizes are shown below the x-axis.
+
+```{r inv3-frequencies, fig.height=4.6}
+pathway_freq <- pathway_df %>%
+  group_by(Pathway, SUBTYPE) %>%
+  summarise(Patients = n(),
+            Mutated = sum(STATUS == "Panel mutation"),
+            Percent = 100 * Mutated / Patients,
+            .groups = "drop")
+
+subtype_ticks <- setNames(
+  paste0(subtype_names, "\n(n = ", subtype_summary$Patients, ")"),
+  subtype_levels)
+
+ggplot(pathway_freq, aes(x = SUBTYPE, y = Percent, fill = Pathway)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+  scale_fill_manual(values = pathway_cols) +
+  scale_x_discrete(labels = subtype_ticks) +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20),
+                     expand = expansion(mult = c(0, 0.03))) +
+  labs(title = "Pathway panel mutation frequencies by PAM50 subtype",
+       x = "PAM50 subtype", y = "Patients with a panel mutation (%)",
+       fill = "Panel") +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  theme(legend.position = "top", axis.text.x = element_text(size = 9))
+```
+
+```{r inv3-frequency-table}
+frequency_table <- pathway_freq %>%
+  mutate(Result = sprintf("%d (%.1f%%)", Mutated, Percent)) %>%
+  select(SUBTYPE, Pathway, Result) %>%
+  pivot_wider(names_from = Pathway, values_from = Result) %>%
+  left_join(subtype_summary, by = "SUBTYPE") %>%
+  select(SUBTYPE, Patients, all_of(names(pathway_genes)))
+
+knitr::kable(frequency_table, row.names = FALSE,
+             col.names = c("Subtype", "Patients", "PI3K/AKT",
+                           "p53/DNA damage", "MAPK/JNK"),
+             caption = "Patients with a panel mutation, n (% within subtype)")
+```
+
+From the plot, we can see that the panels have different subtype patterns.
+The p53/DNA damage response panel is mutated in 89.5% of Basal-like and
+73.1% of HER2-enriched tumours, compared with 12.8% of Luminal A tumours.
+PI3K/AKT mutations are most common in Luminal A tumours (56.9%) and least
+common in Basal-like tumours (14.0%). MAPK/JNK mutations also occur most
+often in Luminal A tumours (19.8%). These patterns are consistent with the
+subtype differences discussed in the TCGA breast cancer study [1].
+
+# Test associations with PAM50 subtype
+
+We test mutation status against subtype separately for each panel. A
+simulated chi-square test avoids relying on the large-sample approximation
+when a subtype has a small expected count. We then apply
+Benjamini-Hochberg (BH) correction across the three panel tests.
+
+```{r inv3-tests}
+set.seed(310)
+pathway_tests <- bind_rows(lapply(names(pathway_genes), function(panel) {
+  panel_df <- filter(pathway_df, Pathway == panel)
+  tab <- table(panel_df$SUBTYPE, panel_df$STATUS)
+  test <- chisq.test(tab, simulate.p.value = TRUE, B = 99999)
+
+  data.frame(Panel = panel,
+             Chi_square = unname(test$statistic),
+             p = test$p.value)
+})) %>%
+  mutate(p_adj_BH = p.adjust(p, method = "BH"))
+
+knitr::kable(pathway_tests, digits = 5, row.names = FALSE,
+             caption = "Panel mutation status vs subtype (BH-adjusted)")
+```
+
+Based on the output above, mutation status is associated with PAM50 subtype
+for all three panels after BH correction (adjusted p < 0.001 for each).
+The test compares all five subtypes together. Identifying which individual
+subtype pairs differ would require additional comparisons.
+
+With 99,999 simulations, the smallest possible raw p-value is 0.00001.
+This is the simulation resolution. It limits how precisely we can describe
+very strong associations, and BH correction may increase this value.
+
+# Which genes contribute most to the panel results?
+
+A panel's pattern may mainly reflect one frequently mutated gene. We
+compare each panel's total with the number of patients carrying a mutation
+in its most frequently mutated gene: PIK3CA, TP53 or MAP3K1.
+
+```{r inv3-gene-contribution}
+dominant_genes <- c("PI3K/AKT" = "PIK3CA",
+                    "p53/DNA damage response" = "TP53",
+                    "MAPK/JNK" = "MAP3K1")
+
+gene_contribution <- bind_rows(lapply(names(dominant_genes), function(panel) {
+  gene <- dominant_genes[[panel]]
+  gene_patients <- mut_ns$PATIENT_ID[mut_ns$Hugo_Symbol == gene]
+  n_gene <- sum(subtype_df$PATIENT_ID %in% gene_patients)
+  n_panel <- panel_summary$Mutated[panel_summary$Pathway == panel]
+
+  data.frame(Panel = panel, Gene = gene,
+             Gene_mutated = n_gene, Panel_mutated = n_panel,
+             Pct_of_panel = round(100 * n_gene / n_panel, 1))
+}))
+knitr::kable(gene_contribution, row.names = FALSE,
+             caption = "Contribution of the most frequently mutated panel gene")
+```
+
+Based on the output above, TP53 is mutated in 342 of the 366 patients with
+a p53/DNA damage response panel mutation (93.4%). PIK3CA accounts for
+341 of 423 PI3K/AKT-positive patients (80.6%), and MAP3K1 for 87 of
+127 MAPK/JNK-positive patients (68.5%). The p53 panel result is therefore
+dominated by TP53. Other genes add patients to each panel, but grouping
+genes does not make the result independent of the most common driver.
+
+# Summary and limitations
+
+- Mutation frequencies in all three selected panels differ across PAM50
+  subtypes after BH correction (adjusted p < 0.001 for each).
+- Basal-like and HER2-enriched tumours have the highest p53/DNA damage
+  response panel mutation frequencies. Luminal A tumours have the highest
+  PI3K/AKT and MAPK/JNK panel mutation frequencies.
+- The p53 panel pattern is mainly driven by TP53, which accounts for
+  93.4% of patients with a mutation in that panel.
+- The panels contain selected genes and differ in size. They do not
+  measure every possible alteration in a pathway, and larger gene sets
+  have more opportunities to contain a mutation.
+- Mutation status alone cannot establish whether a pathway is activated
+  or suppressed. This analysis does not measure copy number changes,
+  protein abundance or phosphorylation. Expression analysis in Report 2
+  can provide additional evidence about biological effects.
+- Twenty-five patients lack a subtype label, and the Normal-like group
+  contains only 36 patients. These limitations affect the scope and
+  precision of the subtype comparisons.
+
+# Reference
+
+[1] The Cancer Genome Atlas Network, "Comprehensive molecular portraits of
+human breast tumours," Nature, vol. 490, no. 7418, pp. 61-70, 2012.
+doi:10.1038/nature11412.
+
+# Session info
+
+```{r inv3-session}
+sessionInfo()
+```
