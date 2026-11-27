@@ -1,0 +1,332 @@
+---
+title: "Investigation 2: Survival by race (TCGA-BRCA)"
+author: "Group 6 - Doruk On"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}}
+  - \RecustomVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.2,
+                      fig.align = "center")
+set.seed(310)
+```
+
+# Packages and data
+
+This file builds on `mutationAnalysis.Rmd`, which cleans the clinical data,
+defines the cohort of 1,006 patients with clinical, mutation and expression
+data, filters to non-synonymous mutations and saves everything to
+`processed/report1_objects.rds`. We load that file here so both analyses use
+the same cohort and the same mutation calls.
+
+```{r packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(survival)
+library(survminer)
+theme_set(theme_bw(base_size = 11))
+
+# Same subtype colours as mutationAnalysis.Rmd
+subtype_cols <- c(LumA = "#1f4e9c", LumB = "#6fa8dc", Her2 = "#e377c2",
+                  Basal = "#d62728", Normal = "#2ca02c")
+# Driver genes flagged as Mutant / Wild-type in the saved cohort
+drivers <- c("TP53", "PIK3CA", "CDH1", "GATA3", "MAP3K1", "KMT2C", "PTEN")
+```
+
+```{r load}
+cohort <- readRDS("processed/report1_objects.rds")$cohort
+dim(cohort)
+table(cohort$RACE, useNA = "ifany")
+```
+
+Question: does overall survival differ between racial groups, and if it does,
+is the difference explained by subtype, stage or age, or by differences in
+driver mutations?
+
+# Define the race groups
+
+`RACE` is self-reported. We keep the three groups with enough patients to
+analyse (White, Black or African American, Asian). One American Indian or
+Alaska Native patient and the patients with no race recorded are removed,
+because a single patient or an unknown group cannot be compared.
+
+```{r inv7-race-groups}
+race_cols <- c(White = "grey40", Black = "#d62728", Asian = "#1f4e9c")
+
+race_df <- cohort %>%
+  mutate(RACE3 = case_when(
+    RACE == "White"                     ~ "White",
+    RACE == "Black or African American" ~ "Black",
+    RACE == "Asian"                     ~ "Asian")) %>%
+  filter(!is.na(RACE3)) %>%
+  mutate(RACE3 = factor(RACE3, levels = c("White", "Black", "Asian")),
+         # Disease-specific survival: "1:DEAD WITH TUMOR" counts as an event
+         DSS_EVENT  = suppressWarnings(as.numeric(substr(DSS_STATUS, 1, 1))),
+         DSS_MONTHS = as.numeric(DSS_MONTHS))
+
+c(kept = nrow(race_df), removed = nrow(cohort) - nrow(race_df))
+```
+
+# Who is in each group?
+
+```{r inv7-race-summary}
+race_summary <- race_df %>%
+  group_by(Race = RACE3) %>%
+  summarise(Patients        = n(),
+            Median_age      = median(AGE, na.rm = TRUE),
+            Deaths          = sum(OS_EVENT, na.rm = TRUE),
+            Pct_died        = round(100 * Deaths / Patients, 1),
+            Median_followup = round(median(OS_MONTHS, na.rm = TRUE), 1),
+            # Deaths per 100 person-years corrects for unequal follow-up
+            Deaths_per_100py = round(100 * Deaths /
+                                     (sum(OS_MONTHS, na.rm = TRUE) / 12), 2))
+knitr::kable(race_summary, caption = "Patients, deaths and follow-up by race")
+
+kruskal.test(AGE ~ RACE3, data = race_df)
+```
+
+Based on the output above, we keep 918 patients (697 White, 162 Black, 59
+Asian). Black and Asian patients are diagnosed younger (median 54 years) than
+White patients (median 59 years; Kruskal-Wallis p = 0.005). The Asian group
+has only 3 deaths and a short median follow-up (12.7 months), so any survival
+estimate for this group is very uncertain. The death rate per 100
+person-years is similar for White (3.93) and Black (4.12) patients.
+
+# Subtype and stage mix by race
+
+If one group has more aggressive subtypes (Basal, Her2), it may have worse
+survival for that reason alone, so we check this before comparing survival.
+
+```{r inv7-race-subtype, fig.height=3.6}
+sub_df <- filter(race_df, !is.na(SUBTYPE))
+
+ggplot(sub_df, aes(x = RACE3, fill = SUBTYPE)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = subtype_cols) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_discrete(labels = function(x)
+    paste0(x, "\n(n = ", table(sub_df$RACE3)[x], ")")) +
+  labs(title = "PAM50 subtype mix by race", x = "Race",
+       y = "Patients", fill = "Subtype")
+
+tab_sub <- table(sub_df$RACE3, sub_df$SUBTYPE)
+round(100 * prop.table(tab_sub, 1), 1)
+chisq.test(tab_sub, simulate.p.value = TRUE, B = 1e5)
+```
+
+Based on the output above, the subtype mix differs strongly by race
+(p = 1e-05, the smallest value possible with 100000 simulations). Basal
+tumours make up 33.3% of tumours in Black patients, about twice the share in
+White patients (15.6%). Asian patients have more Her2 (25.4%) and LumB
+(27.1%) tumours. White patients have the most LumA tumours (56.6%), the
+subtype with the best prognosis. The higher share of Basal tumours in Black
+women matches previous population studies.
+
+```{r inv7-race-stage}
+tab_stage <- table(race_df$RACE3, race_df$STAGE_GROUP)
+round(100 * prop.table(tab_stage, 1), 1)
+fisher.test(tab_stage)
+```
+
+The share of late-stage (III-IV) tumours is similar across the three groups
+(20-24%, Fisher p = 0.63), so stage at diagnosis does not differ by race in
+this cohort.
+
+# Overall and disease-specific survival by race
+
+The Kaplan-Meier plots are cut at 120 months because very few patients are
+followed beyond that, so the tail of the curves is unreliable. The log-rank
+p-value uses all of the follow-up.
+
+```{r inv7-km-os, fig.height=5.5}
+fit_race_os <- survfit(Surv(OS_MONTHS, OS_EVENT) ~ RACE3, data = race_df)
+ggsurvplot(fit_race_os, data = race_df, pval = TRUE, risk.table = TRUE,
+           palette = unname(race_cols), legend.title = "Race",
+           legend.labs = levels(race_df$RACE3),
+           xlim = c(0, 120), break.time.by = 24,
+           title = "Overall survival by race",
+           xlab = "Months", ylab = "Survival probability",
+           risk.table.height = 0.25, ggtheme = theme_bw())
+survdiff(Surv(OS_MONTHS, OS_EVENT) ~ RACE3, data = race_df)
+```
+
+From the plot, we can see that the three curves overlap, and the log-rank
+test finds no difference in overall survival (p = 0.89). The `survdiff`
+output shows that each group has almost exactly the number of deaths
+expected if all groups had the same risk (White 102 observed vs 102.7
+expected, Black 24 vs 22.6, Asian 3 vs 3.7).
+
+Overall survival counts deaths from any cause. Disease-specific survival only
+counts patients who died with tumour, which removes deaths unrelated to the
+cancer.
+
+```{r inv7-km-dss, fig.height=5.5}
+dss_df  <- filter(race_df, !is.na(DSS_EVENT), !is.na(DSS_MONTHS))
+fit_race_dss <- survfit(Surv(DSS_MONTHS, DSS_EVENT) ~ RACE3, data = dss_df)
+ggsurvplot(fit_race_dss, data = dss_df, pval = TRUE, risk.table = TRUE,
+           palette = unname(race_cols), legend.title = "Race",
+           legend.labs = levels(dss_df$RACE3),
+           xlim = c(0, 120), break.time.by = 24,
+           title = "Disease-specific survival by race",
+           xlab = "Months", ylab = "Survival probability",
+           risk.table.height = 0.25, ggtheme = theme_bw())
+```
+
+Disease-specific survival does not differ by race either (log-rank p = 0.82),
+so the null result is not caused by deaths from other causes.
+
+# Cox models: is the race effect explained by other variables?
+
+We fit the same model three times, adding the possible confounders step by
+step, and watch how the hazard ratio (HR) for each race changes. White
+patients are the reference group (HR = 1).
+
+```{r inv7-cox}
+cox_df <- race_df %>% filter(!is.na(SUBTYPE), !is.na(STAGE_GROUP))
+
+m1 <- coxph(Surv(OS_MONTHS, OS_EVENT) ~ RACE3, data = cox_df)
+m2 <- coxph(Surv(OS_MONTHS, OS_EVENT) ~ RACE3 + AGE + STAGE_GROUP,
+            data = cox_df)
+m3 <- coxph(Surv(OS_MONTHS, OS_EVENT) ~ RACE3 + AGE + STAGE_GROUP + SUBTYPE,
+            data = cox_df)
+
+# Pull the race rows out of each model into one table
+race_rows <- function(model, label) {
+  s  <- summary(model)
+  rr <- grep("^RACE3", rownames(s$coefficients))
+  data.frame(Model = label,
+             Term  = sub("RACE3", "", rownames(s$coefficients)[rr]),
+             HR    = s$conf.int[rr, 1],
+             CI_low  = s$conf.int[rr, 3],
+             CI_high = s$conf.int[rr, 4],
+             p     = s$coefficients[rr, 5])
+}
+cox_race <- bind_rows(race_rows(m1, "1. Race only"),
+                      race_rows(m2, "2. + age, stage"),
+                      race_rows(m3, "3. + age, stage, subtype"))
+knitr::kable(cox_race, digits = 3, row.names = FALSE,
+             caption = paste0("Hazard ratio for death vs White patients (n = ",
+                              nrow(cox_df), ", ", sum(cox_df$OS_EVENT),
+                              " deaths)"))
+```
+
+```{r inv7-cox-forest, fig.height=3.2}
+ggplot(cox_race, aes(x = HR, y = Model, colour = Term)) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(xmin = CI_low, xmax = CI_high),
+                  position = position_dodge(width = 0.5)) +
+  scale_x_log10() +
+  scale_colour_manual(values = race_cols[c("Black", "Asian")]) +
+  scale_y_discrete(limits = rev) +
+  labs(title = "Hazard ratio for death vs White patients",
+       x = "Hazard ratio (log scale, 95% CI)", y = NULL, colour = "Race")
+```
+
+```{r inv7-cox-full}
+# Full adjusted model and the proportional hazards check
+knitr::kable(cbind(HR = summary(m3)$conf.int[, 1],
+                   CI_low = summary(m3)$conf.int[, 3],
+                   CI_high = summary(m3)$conf.int[, 4],
+                   p = summary(m3)$coefficients[, 5]),
+             digits = 3, caption = "Fully adjusted Cox model (model 3)")
+cox.zph(m3)
+```
+
+Based on the output above, race is not associated with survival in any of
+the three models. The hazard ratio for Black vs White patients stays close to
+1 (1.01 unadjusted, 1.11 after age and stage, 0.91 after also adding
+subtype; all p > 0.67), and every confidence interval crosses 1. The Asian
+intervals are very wide (about 0.4 to 4) because this group has only 3
+deaths. Adding subtype moves the Black hazard ratio down slightly, which fits
+with Basal tumours being more common in Black patients. In the full model,
+age (HR = 1.04 per year), late stage (HR = 3.05) and the Her2 subtype
+(HR = 2.50 vs LumA) are the significant predictors. As in the stage analysis (Investigation 4),
+stage breaks the proportional hazards assumption (`cox.zph` p = 0.009), so
+its hazard ratio should be read with care.
+
+# Driver mutations by race
+
+To link race to the mutation data, we compare how often the main driver
+genes are mutated in each group (Fisher's exact test per gene, then
+Benjamini-Hochberg correction for testing several genes).
+
+```{r inv7-race-drivers, fig.height=3.6}
+drv_long <- race_df %>%
+  select(RACE3, all_of(drivers)) %>%
+  pivot_longer(all_of(drivers), names_to = "gene", values_to = "status") %>%
+  group_by(gene, RACE3) %>%
+  summarise(pct = 100 * mean(status == "Mutant"), .groups = "drop") %>%
+  mutate(gene = factor(gene, levels = drivers))
+
+ggplot(drv_long, aes(x = gene, y = pct, fill = RACE3)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = race_cols) +
+  labs(title = "Driver gene mutation frequency by race", x = "Gene",
+       y = "Patients mutated (%)", fill = "Race")
+
+drv_tests <- bind_rows(lapply(drivers, function(g) {
+  tab <- table(race_df$RACE3, race_df[[g]])
+  data.frame(gene = g,
+             White = round(100 * prop.table(tab, 1)["White", "Mutant"], 1),
+             Black = round(100 * prop.table(tab, 1)["Black", "Mutant"], 1),
+             Asian = round(100 * prop.table(tab, 1)["Asian", "Mutant"], 1),
+             p = fisher.test(tab, simulate.p.value = TRUE, B = 1e5)$p.value)
+})) %>% mutate(p_adj_BH = p.adjust(p, "BH"))
+knitr::kable(drv_tests, digits = 4,
+             caption = "% of patients mutated, by race (Fisher test, BH-adjusted)")
+```
+
+```{r inv7-tp53-nonbasal}
+# TP53 is common in Basal tumours, so check whether any TP53 difference
+# by race remains among non-Basal patients
+nb <- filter(race_df, !is.na(SUBTYPE), SUBTYPE != "Basal")
+tab_nb <- table(nb$RACE3, nb$TP53)
+round(100 * prop.table(tab_nb, 1), 1)
+fisher.test(tab_nb)
+```
+
+Based on the output above, three driver genes differ by race after BH
+correction:
+
+- **TP53** is mutated more often in Black (46.3%) and Asian (49.2%) patients
+  than in White patients (30.8%; adjusted p = 0.0006).
+- **PIK3CA** is mutated less often in Black patients (21.6%) than in White
+  (36.6%) or Asian (40.7%) patients (adjusted p = 0.002).
+- **CDH1** is mutated less often in Black patients (5.6% vs 13.9% in White;
+  adjusted p = 0.019).
+
+These differences mostly follow the subtype mix: TP53 marks Basal tumours,
+which are more common in Black patients, while PIK3CA and CDH1 are luminal
+genes. However, TP53 still differs by race among non-Basal patients (White
+21.0%, Black 25.5%, Asian 42.3%; Fisher p = 0.003). This is driven by the
+Asian group, which has many Her2 tumours (a TP53-rich subtype), so subtype
+may still explain part of it.
+
+# Summary and limitations
+
+- Survival does not differ by race in this cohort, before or after adjusting
+  for age, stage and subtype (log-rank p = 0.89; adjusted HR for Black vs
+  White = 0.91, 95% CI 0.55-1.50).
+- The tumours themselves differ: Black patients have twice the share of Basal
+  tumours and more TP53 mutations, and Asian patients have more Her2 tumours.
+- Limitations: race is self-reported and also reflects social and
+  access-to-care factors, not only biology. The Black (24 deaths) and
+  especially Asian (3 deaths) groups are small, and follow-up is short
+  (median 25 and 13 months), so the study has low power to detect a real
+  survival difference. TCGA patients were treated at academic centres, which
+  may reduce differences in care seen in the general population.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
